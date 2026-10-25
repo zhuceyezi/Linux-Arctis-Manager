@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+import time
 from typing import Any, Callable, Coroutine, Literal, cast
 
 import usb
@@ -48,6 +49,7 @@ class CoreEngine:
     def __init__(self) -> None:
         self.media_mix = 100
         self.chat_mix = 100
+        self._next_status_request = 0.0
         self.device_status_observers = []
         self.device_settings_observers = []
         self.general_settings_observers = []
@@ -93,9 +95,31 @@ class CoreEngine:
         new_chat_mix = parsed_status({'chat_mix': new_chat_mix}, self.device_config).get('chat_mix', self.chat_mix)
 
         if new_media_mix != self.media_mix or new_chat_mix != self.chat_mix:
+            try:
+                self.pa_audio_manager.set_mix(new_media_mix, new_chat_mix)
+            except Exception as exc:
+                # Keep the pending values so the next input/timeout retries them.
+                now = time.monotonic()
+                if now - getattr(self, '_last_mix_error_log', -5.0) >= 5.0:
+                    self.logger.warning("Could not apply ChatMix; will retry: %s", exc)
+                    self._last_mix_error_log = now
+                return
             self.media_mix = new_media_mix
             self.chat_mix = new_chat_mix
-            self.pa_audio_manager.set_mix(self.media_mix, self.chat_mix)
+
+    def _read_report_batch(self, device, endpoint, max_packet_size):
+        # Drain a short burst in the USB worker before doing PulseAudio work.
+        # The final report carries the position where a fast turn stopped.
+        reports = [list(device.read(endpoint, max_packet_size, 200))]
+        deadline = time.monotonic() + 0.008
+        while len(reports) < 64 and time.monotonic() < deadline:
+            try:
+                reports.append(list(device.read(endpoint, max_packet_size, 1)))
+            except usb.core.USBError as exc:
+                if exc.errno == 110:  # no more buffered reports
+                    break
+                raise
+        return reports
     
     async def listen_endpoint_loop(self, interface_id: int):
         if self.usb_device is None:
@@ -108,28 +132,28 @@ class CoreEngine:
             return
         
         try:
-            read_input: list[int] = list(await asyncio.to_thread(self.usb_device.read, endpoint, max_packet_size, 200))
+            device = self.usb_device
+            read_inputs = await asyncio.to_thread(self._read_report_batch, device, endpoint, max_packet_size)
+            if self.usb_device is not device:
+                return
             if self.device_config is None:
                 return
 
             if self.device_config.status is not None:
-                self.logger.debug(f'Response: {read_input}')
-
-                for mapping in self.device_config.status.response_mapping:
-                    starts_with = f'{mapping.starts_with:02x}'
-                    if len(starts_with) % 2 != 0:
-                        starts_with = f'0{starts_with}'
+                pending_status = {}
+                for read_input in read_inputs:
+                    self.logger.debug('Response: %s', read_input)
                     read_hex_str = ''.join(f'{byte:02x}' for byte in read_input)
-
-                    if read_hex_str.startswith(starts_with):
-                        device_status = mapping.get_status_values(read_input)
-                        if self.device_status is None:
-                            self.device_status = self.new_device_status()
-                        self.device_status.update(device_status)
-                
-                self.manage_mix_change()
-
-            await asyncio.sleep(0.1)
+                    for mapping in self.device_config.status.response_mapping:
+                        starts_with = f'{mapping.starts_with:02x}'
+                        if len(starts_with) % 2 != 0:
+                            starts_with = f'0{starts_with}'
+                        if read_hex_str.startswith(starts_with):
+                            pending_status.update(mapping.get_status_values(read_input))
+                if pending_status:
+                    if self.device_status is None:
+                        self.device_status = self.new_device_status()
+                    self.device_status.update(pending_status)
         except usb.core.USBError as e:
             if e.errno in _UNRECOVERABLE_USB_ERRNOS:
                 raise
@@ -152,8 +176,14 @@ class CoreEngine:
                 if self.device_config is not None:
                     listen_coroutines = [asyncio.create_task(self.listen_endpoint_loop(interface_id)) for interface_id in self.device_config.listen_interface_indexes]
 
-                self.request_device_status()
+                # Do not add a status request for every knob report. Keep USB
+                # bandwidth available for unsolicited input during fast turns.
+                now = time.monotonic()
+                if now >= self._next_status_request:
+                    self._next_status_request = now + 1.0
+                    self.request_device_status()
                 await asyncio.gather(*listen_coroutines)
+                self.manage_mix_change()
                 _retry = False
             except usb.core.USBError as e:
                 for task in listen_coroutines:
